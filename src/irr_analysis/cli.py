@@ -9,8 +9,9 @@ from typing import Annotated
 import typer
 
 from .core import (
+    DEFAULT_MAX_LENGTH,
     AdvertisedRoute,
-    find_uncovered_routes,
+    analyze_coverage,
     load_advertised_routes,
     load_route_filters,
 )
@@ -41,33 +42,70 @@ def parse_csv_paths(value: str, option_name: str) -> list[Path]:
     return paths
 
 
-def print_report(uncovered: list[AdvertisedRoute]) -> None:
-    """Render the human-readable uncovered-route report."""
+def _customer_label(route: AdvertisedRoute) -> str:
+    """Return the report label for a route's customer ASN."""
 
-    typer.echo(f"\n{len(uncovered)} uncovered routes found\n")
-    if not uncovered:
-        return
+    if route.customer_asn is None:
+        return "LOCAL/UNKNOWN"
+    return f"AS{route.customer_asn}"
 
-    customer_counts = Counter(
-        route.customer_asn or "LOCAL/UNKNOWN" for route in uncovered
-    )
 
-    typer.echo("Missing Routes By Customer ASN")
+def _print_section(
+    title: str,
+    reason: str,
+    routes: list[AdvertisedRoute],
+) -> None:
+    """Render a per-customer summary and one detail line per route."""
+
+    customer_counts = Counter(_customer_label(route) for route in routes)
+
+    typer.echo(title)
     typer.echo("-" * 40)
     for customer, count in customer_counts.most_common():
-        label = customer if customer == "LOCAL/UNKNOWN" else f"AS{customer}"
-        typer.echo(f"{label}: {count}")
+        typer.echo(f"{customer}: {count}")
 
     typer.echo()
-    for route in uncovered:
-        customer = (
-            f"AS{route.customer_asn}"
-            if route.customer_asn is not None
-            else "LOCAL/UNKNOWN"
+    for route in routes:
+        typer.echo(
+            f"{route.network} - {reason} "
+            f"- Customer {_customer_label(route)} "
+            f"- AS-Path {route.as_path or 'N/A'}"
+        )
+
+
+def print_report(
+    uncovered: list[AdvertisedRoute],
+    too_specific: list[AdvertisedRoute],
+    max_len_v4: int,
+    max_len_v6: int,
+) -> None:
+    """Render the human-readable coverage report."""
+
+    typer.echo(f"\n{len(uncovered)} uncovered routes found")
+    typer.echo(
+        f"{len(too_specific)} too-specific routes found "
+        f"(longer than /{max_len_v4} IPv4 or /{max_len_v6} IPv6)\n"
+    )
+
+    if uncovered:
+        _print_section(
+            "Missing Routes By Customer ASN",
+            "No covering route filter entry",
+            uncovered,
+        )
+
+    if too_specific:
+        if uncovered:
+            typer.echo()
+        _print_section(
+            "Too-Specific Routes By Customer ASN",
+            "Covered, but longer than the maximum accepted prefix length",
+            too_specific,
         )
         typer.echo(
-            f"{route.network} - No covering route filter entry "
-            f"- Customer {customer} - AS-Path {route.as_path or 'N/A'}"
+            "\nToo-specific routes are rejected by a length-limited filter "
+            "unless another policy,\nsuch as a blackhole community match, "
+            "accepts them."
         )
 
 
@@ -98,6 +136,31 @@ def main(
             help="Exit with status 1 when uncovered routes are found.",
         ),
     ] = False,
+    max_len_v4: Annotated[
+        int,
+        typer.Option(
+            "--max-len-v4",
+            min=0,
+            max=32,
+            help="Longest IPv4 prefix accepted beneath a filter entry.",
+        ),
+    ] = DEFAULT_MAX_LENGTH[4],
+    max_len_v6: Annotated[
+        int,
+        typer.Option(
+            "--max-len-v6",
+            min=0,
+            max=128,
+            help="Longest IPv6 prefix accepted beneath a filter entry.",
+        ),
+    ] = DEFAULT_MAX_LENGTH[6],
+    fail_on_too_specific: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-too-specific",
+            help="Exit with status 1 when too-specific routes are found.",
+        ),
+    ] = False,
 ) -> None:
     """Compare advertised routes with trusted IRR/RPKI filter data."""
 
@@ -116,10 +179,16 @@ def main(
         f"from {len(filter_files)} file(s)"
     )
 
-    uncovered = find_uncovered_routes(advertised_routes, route_filters)
-    print_report(uncovered)
+    result = analyze_coverage(
+        advertised_routes,
+        route_filters,
+        max_length={4: max_len_v4, 6: max_len_v6},
+    )
+    print_report(result.uncovered, result.too_specific, max_len_v4, max_len_v6)
 
-    if fail_on_uncovered and uncovered:
+    if fail_on_uncovered and result.uncovered:
+        raise typer.Exit(code=1)
+    if fail_on_too_specific and result.too_specific:
         raise typer.Exit(code=1)
 
 

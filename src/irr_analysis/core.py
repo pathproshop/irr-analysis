@@ -36,6 +36,13 @@ BGP_MARKERS = {
 ASN_RE = re.compile(r"^(?:[0-9]+|[0-9]+\.[0-9]+)$")
 
 
+# Longest prefix an upstream normally accepts beneath a registered covering
+# prefix. Generated filters are commonly applied as "upto /24" for IPv4 and
+# "upto /48" for IPv6, so anything longer is rejected unless a separate policy
+# (for example a blackhole community match) accepts it.
+DEFAULT_MAX_LENGTH: dict[int, int] = {4: 24, 6: 48}
+
+
 @dataclass(frozen=True, slots=True)
 class AdvertisedRoute:
     """Information retained for one advertised prefix."""
@@ -45,6 +52,19 @@ class AdvertisedRoute:
     raw_line: str
     as_path: str
     customer_asn: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageResult:
+    """Advertised routes that a generated filter set would not accept.
+
+    ``uncovered`` routes have no covering filter entry at all.
+    ``too_specific`` routes fall inside a filter entry but are longer than the
+    maximum accepted prefix length and are not listed exactly.
+    """
+
+    uncovered: list[AdvertisedRoute]
+    too_specific: list[AdvertisedRoute]
 
 
 def parse_network_token(token: str) -> IPNetwork | None:
@@ -227,11 +247,63 @@ def find_uncovered_routes(
         if not any(route.network.subnet_of(item) for item in same_family_filters):
             uncovered.append(route)
 
-    return sorted(
-        uncovered,
-        key=lambda route: (
-            route.network.version,
-            int(route.network.network_address),
-            route.network.prefixlen,
-        ),
+    return sorted(uncovered, key=_sort_key)
+
+
+def _sort_key(route: AdvertisedRoute) -> tuple[int, int, int]:
+    """Order routes by family, then address, then prefix length."""
+
+    return (
+        route.network.version,
+        int(route.network.network_address),
+        route.network.prefixlen,
+    )
+
+
+def analyze_coverage(
+    advertised_routes: dict[str, AdvertisedRoute],
+    route_filters: Iterable[IPNetwork],
+    max_length: dict[int, int] | None = None,
+) -> CoverageResult:
+    """Classify advertisements against filters and a prefix-length ceiling.
+
+    A route is accepted when it matches a filter entry exactly, or when it
+    falls inside a filter entry and its prefix length does not exceed the
+    ceiling for its address family. This models filters applied as
+    ``upto /24`` (IPv4) and ``upto /48`` (IPv6).
+
+    Routes inside a filter entry but longer than the ceiling are returned as
+    ``too_specific`` rather than ``uncovered``. Communities are not visible in
+    advertised-route output, so a legitimate blackhole host route cannot be
+    told apart from a leaked more-specific; reporting them separately leaves
+    that judgment to the operator.
+    """
+
+    ceilings = dict(DEFAULT_MAX_LENGTH)
+    if max_length:
+        ceilings.update(max_length)
+
+    filters_by_version: dict[int, list[IPNetwork]] = {4: [], 6: []}
+    exact: set[IPNetwork] = set()
+    for route_filter in route_filters:
+        filters_by_version[route_filter.version].append(route_filter)
+        exact.add(route_filter)
+
+    uncovered: list[AdvertisedRoute] = []
+    too_specific: list[AdvertisedRoute] = []
+
+    for route in advertised_routes.values():
+        network = route.network
+        if network in exact:
+            continue
+
+        same_family_filters = filters_by_version[network.version]
+        if not any(network.subnet_of(item) for item in same_family_filters):
+            uncovered.append(route)
+        elif network.prefixlen > ceilings[network.version]:
+            too_specific.append(route)
+
+    return CoverageResult(
+        uncovered=sorted(uncovered, key=_sort_key),
+        too_specific=sorted(too_specific, key=_sort_key),
     )
