@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, TypeAlias
-
+from typing import TypeAlias
 
 IPNetwork: TypeAlias = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -229,24 +229,55 @@ def load_route_filters(filenames: Iterable[str | Path]) -> set[IPNetwork]:
     return filters
 
 
+# Maps IP version -> prefix length -> set of network addresses (as integers).
+FilterIndex: TypeAlias = dict[int, dict[int, set[int]]]
+
+_ADDRESS_BITS = {4: 32, 6: 128}
+
+
+def build_filter_index(route_filters: Iterable[IPNetwork]) -> FilterIndex:
+    """Index filter prefixes for constant-time covering-prefix lookups.
+
+    Comparing every route with every filter entry is slow for large filter
+    sets. Grouping entries by prefix length lets a route test each of its
+    possible covering prefixes with one set lookup per length.
+    """
+
+    index: FilterIndex = {4: {}, 6: {}}
+    for route_filter in route_filters:
+        by_length = index[route_filter.version]
+        by_length.setdefault(route_filter.prefixlen, set()).add(
+            int(route_filter.network_address)
+        )
+    return index
+
+
+def is_covered(network: IPNetwork, index: FilterIndex) -> bool:
+    """Return whether *network* equals or falls inside an indexed filter."""
+
+    bits = _ADDRESS_BITS[network.version]
+    address = int(network.network_address)
+    for length, addresses in index[network.version].items():
+        if length > network.prefixlen:
+            continue
+        shift = bits - length
+        if (address >> shift) << shift in addresses:
+            return True
+    return False
+
+
 def find_uncovered_routes(
     advertised_routes: dict[str, AdvertisedRoute],
     route_filters: Iterable[IPNetwork],
 ) -> list[AdvertisedRoute]:
     """Return advertisements without a same-family covering filter prefix."""
 
-    # Partitioning by IP version avoids invalid IPv4/IPv6 comparisons and cuts
-    # the number of containment checks for mixed-family input.
-    filters_by_version: dict[int, list[IPNetwork]] = {4: [], 6: []}
-    for route_filter in route_filters:
-        filters_by_version[route_filter.version].append(route_filter)
-
-    uncovered = []
-    for route in advertised_routes.values():
-        same_family_filters = filters_by_version[route.network.version]
-        if not any(route.network.subnet_of(item) for item in same_family_filters):
-            uncovered.append(route)
-
+    index = build_filter_index(route_filters)
+    uncovered = [
+        route
+        for route in advertised_routes.values()
+        if not is_covered(route.network, index)
+    ]
     return sorted(uncovered, key=_sort_key)
 
 
@@ -283,22 +314,18 @@ def analyze_coverage(
     if max_length:
         ceilings.update(max_length)
 
-    filters_by_version: dict[int, list[IPNetwork]] = {4: [], 6: []}
-    exact: set[IPNetwork] = set()
-    for route_filter in route_filters:
-        filters_by_version[route_filter.version].append(route_filter)
-        exact.add(route_filter)
+    index = build_filter_index(route_filters)
 
     uncovered: list[AdvertisedRoute] = []
     too_specific: list[AdvertisedRoute] = []
 
     for route in advertised_routes.values():
         network = route.network
-        if network in exact:
+        exact_lengths = index[network.version].get(network.prefixlen, set())
+        if int(network.network_address) in exact_lengths:
             continue
 
-        same_family_filters = filters_by_version[network.version]
-        if not any(network.subnet_of(item) for item in same_family_filters):
+        if not is_covered(network, index):
             uncovered.append(route)
         elif network.prefixlen > ceilings[network.version]:
             too_specific.append(route)

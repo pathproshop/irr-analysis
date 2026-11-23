@@ -12,14 +12,14 @@ from irr_analysis.core import (
 
 
 def test_junos_ipv6_customer_asn_and_path():
-    parts = "* 3fff:100::/32 Self 75 64496 I".split()
+    parts = ["*", "3fff:100::/32", "Self", "75", "64496", "I"]
     as_path, customer = extract_path_data(parts, prefix_index=1)
     assert as_path == "75 64496 I"
     assert customer == "64496"
 
 
 def test_junos_local_route_is_unknown():
-    parts = "* 2001:db8:100::/40 Self 0 I".split()
+    parts = ["*", "2001:db8:100::/40", "Self", "0", "I"]
     as_path, customer = extract_path_data(parts, prefix_index=1)
     assert as_path == "0 I"
     assert customer is None
@@ -141,3 +141,21 @@ def test_custom_ceiling_overrides_default(tmp_path):
     assert analyze_coverage(routes, filters).too_specific != []
     relaxed = analyze_coverage(routes, filters, max_length={4: 25})
     assert relaxed.too_specific == []
+
+
+def test_default_route_filter_covers_only_its_own_family(tmp_path):
+    routes = _routes(
+        tmp_path,
+        "* 198.51.100.0/24 Self 75 64496 I",
+        "* 2001:db8:1::/48 Self 75 64496 I",
+    )
+    filters = {ipaddress.ip_network("0.0.0.0/0")}
+    result = analyze_coverage(routes, filters)
+    assert [str(route.network) for route in result.uncovered] == ["2001:db8:1::/48"]
+
+
+def test_longer_filter_does_not_cover_shorter_route(tmp_path):
+    routes = _routes(tmp_path, "* 198.51.0.0/16 Self 75 64496 I")
+    filters = {ipaddress.ip_network("198.51.100.0/24")}
+    result = analyze_coverage(routes, filters)
+    assert [str(route.network) for route in result.uncovered] == ["198.51.0.0/16"]
